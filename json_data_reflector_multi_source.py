@@ -71,16 +71,45 @@ class DataSaver:
             source.set(k, v)
 
 class JsonDataReflectorMultiSource:
-    def __init__(self, managed_data, sources: Dict[str, DataSource], max_memory_size: str = "2MB"):
+    def __init__(self, managed_data, sources: Dict[str, DataSource], max_memory_size: str = "2MB", default_source_id: Optional[str] = None):
         self.sources = sources  # {source_id: DataSource}
         self.max_memory_size = self._parse_size(max_memory_size)
-        self.accessor = DataAccessor(self._build_combined_data())
-        self.loader = DataLoader(self.sources)
-        self.saver = DataSaver(self.sources)
         self.lock = threading.Lock()
         self.unloaded_keys = set()
         self.key_sizes = {}  # Track size of large keys
         self.large_key_threshold = self.max_memory_size // 10  # 10% of max size
+
+        # Xác định id object
+        self.object_id = managed_data.get('id', None)
+        self.managed_data = None
+        self.source_id = None
+        if self.object_id is not None:
+            # Tìm object trong các source
+            found = False
+            for sid, source in self.sources.items():
+                if self.object_id in source.data:
+                    self.managed_data = source.data[self.object_id]
+                    self.source_id = sid
+                    found = True
+                    break
+            if not found:
+                raise ValueError(f"Object with id {self.object_id} not found in any source.")
+        else:
+            # Tạo id mới và đăng ký object mới vào source
+            import uuid
+            self.object_id = str(uuid.uuid4())
+            managed_data['id'] = self.object_id
+            # Chọn source để lưu object mới
+            if default_source_id and default_source_id in self.sources:
+                self.source_id = default_source_id
+            else:
+                self.source_id = next(iter(self.sources.keys()))
+            self.managed_data = managed_data
+            self.sources[self.source_id].data[self.object_id] = self.managed_data
+
+        self.accessor = DataAccessor(self.managed_data)
+        self.loader = DataLoader(self.sources)
+        self.saver = DataSaver(self.sources)
 
     def _parse_size(self, size_str: str) -> int:
         size_str = size_str.upper().strip()
