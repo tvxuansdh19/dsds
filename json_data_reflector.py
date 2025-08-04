@@ -52,6 +52,8 @@ class JsonDataReflector:
         self.saver = DataSaver(self.managed_data)
         self.lock = threading.Lock()
         self.unloaded_keys = set()
+        self.key_sizes = {}  # Track size of large keys
+        self.large_key_threshold = self.max_memory_size // 10  # 10% of max size
 
     def _parse_size(self, size_str: str) -> int:
         size_str = size_str.upper().strip()
@@ -65,16 +67,33 @@ class JsonDataReflector:
             raise ValueError(f"Unknown size format: {size_str}")
 
     def _current_memory_size(self) -> int:
-        return len(json.dumps(self.managed_data).encode('utf-8'))
+        # Ước lượng nhanh: tổng size các key lớn + size các key nhỏ (dùng json.dumps toàn bộ nếu ít key lớn)
+        total = sum(self.key_sizes.values())
+        small_keys = [k for k in self.managed_data if k not in self.key_sizes and k not in self.unloaded_keys]
+        if small_keys:
+            # Serialize các key nhỏ cùng lúc
+            small_dict = {k: self.managed_data[k] for k in small_keys}
+            total += len(json.dumps(small_dict).encode('utf-8'))
+        return total
 
     def _unload_if_needed(self):
         while self._current_memory_size() > self.max_memory_size:
-            # Unload the first key (FIFO), mark as 'unloaded'
-            for k in list(self.managed_data.keys()):
-                if k not in self.unloaded_keys:
-                    self.managed_data[k] = "unloaded"
-                    self.unloaded_keys.add(k)
-                    break
+            # Ưu tiên unload key lớn nhất
+            candidates = [k for k in self.key_sizes if k not in self.unloaded_keys]
+            if candidates:
+                # Unload key lớn nhất
+                k = max(candidates, key=lambda x: self.key_sizes[x])
+            else:
+                # Fallback: FIFO
+                k = None
+                for key in self.managed_data.keys():
+                    if key not in self.unloaded_keys:
+                        k = key
+                        break
+            if k is not None:
+                self.managed_data[k] = "unloaded"
+                self.unloaded_keys.add(k)
+                self.key_sizes.pop(k, None)
             else:
                 break
 
@@ -87,15 +106,27 @@ class JsonDataReflector:
                 loaded = self.loader.load_batch([key])
                 self.managed_data[key] = loaded.get(key, default)
                 self.unloaded_keys.discard(key)
+                # Cập nhật lại size nếu là key lớn
+                size = len(json.dumps(self.managed_data[key]).encode('utf-8'))
+                if size > self.large_key_threshold:
+                    self.key_sizes[key] = size
+                else:
+                    self.key_sizes.pop(key, None)
                 value = self.accessor.get(key_path, default)
             return value
 
     def set(self, key_path: str, value: Any):
         with self.lock:
             self.accessor.set(key_path, value)
+            # Cập nhật lại size nếu là key lớn
+            key = key_path.split('.')[0]
+            size = len(json.dumps(self.managed_data[key]).encode('utf-8'))
+            if size > self.large_key_threshold:
+                self.key_sizes[key] = size
+            else:
+                self.key_sizes.pop(key, None)
             self._unload_if_needed()
             # Giả lập lưu batch
-            key = key_path.split('.')[0]
             self.saver.save_batch({key: self.managed_data[key]})
 
 # Example usage:
